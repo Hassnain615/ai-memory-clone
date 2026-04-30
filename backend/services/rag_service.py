@@ -11,7 +11,7 @@ import fitz  # PyMuPDF
 from collections import Counter
 
 # NEW - hardcoded for hackathon
-GEMINI_API_KEY = "AIzaSyBgSK2KrCEwtRBEvDhuE_pxGJeuYlpl3Ik"
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "your-key-here")
 genai.configure(api_key=GEMINI_API_KEY, transport="rest")
 
 
