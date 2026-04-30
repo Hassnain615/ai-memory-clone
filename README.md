@@ -13,7 +13,9 @@ A hackathon-ready RAG-powered web app that lets you upload notes & PDFs and chat
 1. Go to: https://aistudio.google.com/app/apikey
 2. Click **"Create API Key"**
 3. Copy it
-
+## Setup
+Create backend/.env and add:
+GEMINI_API_KEY=your_gemini_key_here
 ---
 
 ### Step 2 — Backend Setup
