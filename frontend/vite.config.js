@@ -6,11 +6,13 @@ export default defineConfig({
   server: {
     port: 3000,
     proxy: {
-      '/api': {
-        target: 'http://localhost:8000',
-        changeOrigin: true,
-        rewrite: path => path.replace(/^\/api/, '')
-      }
-    }
-  }
+      // Backend routes live under /api — no rewrite needed
+      '/api': { target: 'http://localhost:8000', changeOrigin: true },
+    },
+  },
+  build: {
+    rollupOptions: {
+      output: { manualChunks: { d3: ['d3'], react: ['react', 'react-dom', 'react-router-dom'] } },
+    },
+  },
 })

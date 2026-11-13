@@ -1,242 +1,235 @@
-import os
-import re
-import json
-import asyncio
-from typing import Optional
+"""RAGService — per-user vector memory (ChromaDB) + retrieval-augmented generation.
+
+Refactored from the original single-collection version:
+  * every user gets an isolated Chroma collection
+  * chunks carry doc_id / page / chunk_index metadata for precise citations
+  * answers stream token-by-token and fall back to extractive answers without an LLM
+"""
+from __future__ import annotations
+
+import logging
+import threading
+from typing import Iterator
+
 import chromadb
-from chromadb.config import Settings
-import google.generativeai as genai
+import numpy as np
+from chromadb.config import Settings as ChromaSettings
 
-import fitz  # PyMuPDF
-from collections import Counter
+from config import settings
+from services.document_processor import Chunk, extractive_summary
+from services.embeddings import EmbeddingService
+from services.llm import LLMService
 
-# NEW - hardcoded for hackathon
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "your-key-here")
-genai.configure(api_key=GEMINI_API_KEY, transport="rest")
+log = logging.getLogger(__name__)
+
+NO_MEMORY_REPLY = (
+    "I don't have any memories about that yet. Upload notes or PDFs related to this topic "
+    "and I'll be able to answer from them."
+)
+
+SYSTEM_PROMPT = """You are the user's AI Memory Clone — a personal second brain.
+You answer using ONLY the user's stored memories provided in <memories>.
+
+Rules:
+- Ground every claim in the memories. Cite sources inline as [1], [2] matching the memory numbers.
+- If the memories don't contain the answer, say so clearly and suggest what to upload — never invent facts.
+- Be concise, warm and insightful. Use Markdown: short paragraphs, bullet lists, **bold** for key ideas.
+- When useful, connect ideas across different sources and point out patterns or next steps."""
 
 
 class RAGService:
-    def __init__(self):
+    def __init__(self, embeddings: EmbeddingService | None = None, llm: LLMService | None = None):
+        settings.CHROMA_PATH.mkdir(parents=True, exist_ok=True)
         self.client = chromadb.PersistentClient(
-            path="./chroma_db",
-            settings=Settings(anonymized_telemetry=False)
+            path=str(settings.CHROMA_PATH),
+            settings=ChromaSettings(anonymized_telemetry=False),
         )
-        self.collection = self.client.get_or_create_collection(
-            name="memories",
-            metadata={"hnsw:space": "cosine"}
-        )
-        self.model = genai.GenerativeModel("gemini-2.5-flash-lite")
-        self.embed_model = "models/gemini-embedding-001"
-        self.chat_histories = {}
-        self.doc_counter = self._load_counter()
+        self.embeddings = embeddings or EmbeddingService()
+        self.llm = llm or LLMService()
+        self._collections: dict[int, object] = {}
+        self._lock = threading.Lock()
 
-    def _load_counter(self):
-        try:
-            count = self.collection.count()
-            return count
-        except:
-            return 0
+    # -------------------------------------------------------------- collections
+    def _collection_name(self, user_id: int) -> str:
+        return f"mem_u{user_id}_{self.embeddings.signature}"
 
-    def _chunk_text(self, text: str, chunk_size: int = 500, overlap: int = 50) -> list[str]:
-        text = re.sub(r'\s+', ' ', text.strip())
-        words = text.split()
-        chunks = []
-        i = 0
-        while i < len(words):
-            chunk = ' '.join(words[i:i + chunk_size])
-            if chunk.strip():
-                chunks.append(chunk)
-            i += chunk_size - overlap
-        return chunks
+    def collection(self, user_id: int):
+        col = self._collections.get(user_id)
+        if col is None:
+            with self._lock:
+                col = self._collections.get(user_id)
+                if col is None:
+                    col = self.client.get_or_create_collection(
+                        name=self._collection_name(user_id),
+                        metadata={"hnsw:space": "cosine", "embedding_model": self.embeddings.model_name},
+                    )
+                    self._collections[user_id] = col
+        return col
 
-    def _embed(self, texts: list[str]) -> list[list[float]]:
-        embeddings = []
-        for text in texts:
-            result = genai.embed_content(
-                model=self.embed_model,
-                content=text
-            )
-            embeddings.append(result['embedding'])
-        return embeddings
+    def count(self, user_id: int) -> int:
+        return self.collection(user_id).count()
 
-    def _embed_query(self, text: str) -> list[float]:
-        result = genai.embed_content(
-            model=self.embed_model,
-            content=text
-        )
-        return result['embedding']
-
-    async def add_text(self, content: str, metadata: dict) -> dict:
-        chunks = self._chunk_text(content)
+    # -------------------------------------------------------------- indexing
+    def index_document(self, user_id: int, doc_id: int, title: str, kind: str, chunks: list[Chunk]) -> int:
         if not chunks:
-            return {"chunks": 0}
-        embeddings = self._embed(chunks)
-        ids = []
-        docs = []
-        metas = []
-        embs = []
-        for i, (chunk, emb) in enumerate(zip(chunks, embeddings)):
-            doc_id = f"doc_{self.doc_counter}_{i}"
-            ids.append(doc_id)
-            docs.append(chunk)
-            metas.append({**metadata, "chunk_index": i})
-            embs.append(emb)
-            self.doc_counter += 1
-        self.collection.add(ids=ids, documents=docs, metadatas=metas, embeddings=embs)
-        return {"chunks": len(chunks)}
+            return 0
+        col = self.collection(user_id)
+        self.delete_document(user_id, doc_id)  # idempotent re-index
+        batch = 64
+        for start in range(0, len(chunks), batch):
+            part = chunks[start : start + batch]
+            vectors = self.embeddings.embed_documents([c.text for c in part])
+            col.add(
+                ids=[f"d{doc_id}_c{c.index}" for c in part],
+                documents=[c.text for c in part],
+                embeddings=vectors,
+                metadatas=[
+                    {
+                        "doc_id": doc_id,
+                        "title": title,
+                        "kind": kind,
+                        "chunk_index": c.index,
+                        "page": c.page or 0,
+                    }
+                    for c in part
+                ],
+            )
+        return len(chunks)
 
-    async def add_pdf(self, content: bytes, filename: str) -> dict:
-        doc = fitz.open(stream=content, filetype="pdf")
-        full_text = ""
-        for page in doc:
-            full_text += page.get_text()
-        doc.close()
-        return await self.add_text(full_text, {"title": filename, "type": "pdf"})
+    def delete_document(self, user_id: int, doc_id: int) -> None:
+        try:
+            self.collection(user_id).delete(where={"doc_id": doc_id})
+        except Exception as exc:  # noqa: BLE001
+            log.warning("Vector delete failed for doc %s: %s", doc_id, exc)
 
-    def _retrieve(self, query: str, n_results: int = 5) -> list[dict]:
-        if self.collection.count() == 0:
-            return []
-        query_emb = self._embed_query(query)
-        results = self.collection.query(
-            query_embeddings=[query_emb],
-            n_results=min(n_results, self.collection.count())
-        )
-        docs = results.get("documents", [[]])[0]
-        metas = results.get("metadatas", [[]])[0]
-        distances = results.get("distances", [[]])[0]
-        return [
-            {"text": d, "metadata": m, "score": 1 - s}
-            for d, m, s in zip(docs, metas, distances)
+    def clear_user(self, user_id: int) -> None:
+        with self._lock:
+            self._collections.pop(user_id, None)
+            try:
+                self.client.delete_collection(self._collection_name(user_id))
+            except Exception:  # noqa: BLE001 - collection may not exist
+                pass
+
+    def get_document_chunks(self, user_id: int, doc_id: int) -> list[dict]:
+        res = self.collection(user_id).get(where={"doc_id": doc_id}, include=["documents", "metadatas"])
+        items = [
+            {"text": d, "chunk_index": m.get("chunk_index", 0), "page": m.get("page") or None}
+            for d, m in zip(res.get("documents") or [], res.get("metadatas") or [])
         ]
+        return sorted(items, key=lambda x: x["chunk_index"])
 
-    async def chat(self, message: str, session_id: str) -> dict:
-        chunks = self._retrieve(message, n_results=5)
-        has_memory = len(chunks) > 0
-        if not has_memory:
-            context = "No memories uploaded yet."
-        else:
-            context = "\n\n---\n\n".join([
-                f"[Source: {c['metadata'].get('title', 'Unknown')}]\n{c['text']}"
-                for c in chunks
-            ])
-        if session_id not in self.chat_histories:
-            self.chat_histories[session_id] = []
-        history = self.chat_histories[session_id]
-        history_text = ""
-        for h in history[-6:]:
-            history_text += f"Human: {h['user']}\nAssistant: {h['assistant']}\n\n"
-        prompt = f"""You are an AI Memory Clone — a personalized second brain assistant. You answer based ONLY on the user's stored memories below.
-
-STORED MEMORIES:
-{context}
-
-CONVERSATION HISTORY:
-{history_text}
-
-INSTRUCTIONS:
-- Answer based on the stored memories above
-- If memories are relevant, synthesize insights and patterns
-- If no relevant memory found, say exactly: "I don't have memory of that yet. Upload some notes or PDFs to teach me!"
-- Be conversational, insightful, and personal
-- Reference specific sources when helpful
-- Spot patterns and give actionable suggestions
-
-USER: {message}
-ASSISTANT:"""
-
-        response = self.model.generate_content(prompt)
-        reply = response.text.strip()
-        history.append({"user": message, "assistant": reply})
-        if len(history) > 20:
-            self.chat_histories[session_id] = history[-20:]
-        sources = list(set([c['metadata'].get('title', 'Unknown') for c in chunks]))
-        return {
-            "reply": reply,
-            "sources": sources if has_memory else [],
-            "chunks_used": len(chunks)
-        }
-
-    def get_all_memories(self) -> dict:
-        count = self.collection.count()
-        if count == 0:
-            return {"total_chunks": 0, "sources": []}
-        results = self.collection.get(include=["metadatas"])
-        metas = results.get("metadatas", [])
-        sources = {}
-        for m in metas:
-            title = m.get("title", "Unknown")
-            t = m.get("type", "text")
-            if title not in sources:
-                sources[title] = {"title": title, "type": t, "chunks": 0}
-            sources[title]["chunks"] += 1
-        return {
-            "total_chunks": count,
-            "sources": list(sources.values())
-        }
-
-    def get_knowledge_graph(self) -> dict:
-        count = self.collection.count()
-        if count == 0:
-            return {"nodes": [], "edges": []}
-        results = self.collection.get(include=["documents", "metadatas"])
-        docs = results.get("documents", [])
-        metas = results.get("metadatas", [])
-        # Extract keywords using simple frequency analysis
-        stop_words = set([
-            "the", "a", "an", "and", "or", "but", "in", "on", "at", "to", "for",
-            "of", "with", "by", "from", "is", "was", "are", "were", "be", "been",
-            "have", "has", "had", "do", "does", "did", "will", "would", "could",
-            "should", "may", "might", "can", "this", "that", "these", "those",
-            "it", "its", "i", "you", "we", "they", "he", "she", "my", "your",
-            "our", "their", "not", "no", "so", "if", "as", "up", "out", "about",
-            "into", "than", "then", "when", "where", "which", "who", "what",
-            "how", "all", "also", "more", "just", "like", "some", "there"
-        ])
-        word_freq = Counter()
-        word_doc_map = {}  # word -> set of sources
-        for doc, meta in zip(docs, metas):
-            words = re.findall(r'\b[a-zA-Z]{4,}\b', doc.lower())
-            source = meta.get("title", "Unknown")
-            for w in words:
-                if w not in stop_words:
-                    word_freq[w] += 1
-                    if w not in word_doc_map:
-                        word_doc_map[w] = set()
-                    word_doc_map[w].add(source)
-        # Top 20 keywords
-        top_words = [w for w, _ in word_freq.most_common(20)]
-        # Source nodes
-        sources = list(set([m.get("title", "Unknown") for m in metas]))
-        nodes = []
-        for i, src in enumerate(sources):
-            nodes.append({"id": f"src_{i}", "label": src, "type": "source", "size": 20})
-        for i, word in enumerate(top_words):
-            freq = word_freq[word]
-            nodes.append({"id": f"kw_{i}", "label": word, "type": "keyword", "size": min(5 + freq, 18)})
-        # Edges: keywords to their sources
-        edges = []
-        for i, word in enumerate(top_words):
-            for src in word_doc_map.get(word, []):
-                src_idx = sources.index(src) if src in sources else None
-                if src_idx is not None:
-                    edges.append({
-                        "source": f"src_{src_idx}",
-                        "target": f"kw_{i}",
-                        "weight": word_freq[word]
-                    })
-        # Keyword co-occurrence edges
-        for i in range(len(top_words)):
-            for j in range(i + 1, len(top_words)):
-                shared = word_doc_map.get(top_words[i], set()) & word_doc_map.get(top_words[j], set())
-                if shared:
-                    edges.append({"source": f"kw_{i}", "target": f"kw_{j}", "weight": len(shared)})
-        return {"nodes": nodes, "edges": edges}
-
-    def clear_all(self):
-        self.client.delete_collection("memories")
-        self.collection = self.client.get_or_create_collection(
-            name="memories",
-            metadata={"hnsw:space": "cosine"}
+    # -------------------------------------------------------------- retrieval
+    def retrieve(
+        self,
+        user_id: int,
+        query: str,
+        k: int | None = None,
+        doc_ids: list[int] | None = None,
+        min_score: float | None = None,
+    ) -> list[dict]:
+        col = self.collection(user_id)
+        total = col.count()
+        if total == 0 or not query.strip():
+            return []
+        k = k or settings.RETRIEVAL_TOP_K
+        min_score = settings.RETRIEVAL_MIN_SCORE if min_score is None else min_score
+        where = None
+        if doc_ids:
+            where = {"doc_id": doc_ids[0]} if len(doc_ids) == 1 else {"doc_id": {"$in": doc_ids}}
+        res = col.query(
+            query_embeddings=[self.embeddings.embed_query(query)],
+            n_results=min(k, total),
+            where=where,
+            include=["documents", "metadatas", "distances"],
         )
-        self.doc_counter = 0
-        self.chat_histories = {}
+        docs = (res.get("documents") or [[]])[0]
+        metas = (res.get("metadatas") or [[]])[0]
+        dists = (res.get("distances") or [[]])[0]
+        hits = []
+        for text, meta, dist in zip(docs, metas, dists):
+            score = round(1.0 - float(dist), 4)
+            if score < min_score:
+                continue
+            hits.append(
+                {
+                    "doc_id": meta.get("doc_id"),
+                    "title": meta.get("title", "Untitled"),
+                    "kind": meta.get("kind", "text"),
+                    "page": meta.get("page") or None,
+                    "chunk_index": meta.get("chunk_index", 0),
+                    "text": text,
+                    "score": score,
+                }
+            )
+        return hits
+
+    # -------------------------------------------------------------- generation
+    @staticmethod
+    def build_prompt(question: str, hits: list[dict], history: list[dict]) -> str:
+        blocks = []
+        for i, h in enumerate(hits, start=1):
+            page = f" (page {h['page']})" if h.get("page") else ""
+            blocks.append(f"[{i}] Source: {h['title']}{page}\n{h['text']}")
+        memories = "\n\n".join(blocks)
+        convo = "\n".join(
+            f"{'User' if m['role'] == 'user' else 'Assistant'}: {m['content'][:1500]}" for m in history[-8:]
+        )
+        return (
+            f"<memories>\n{memories or 'No relevant memories found.'}\n</memories>\n\n"
+            f"<conversation>\n{convo or '(new conversation)'}\n</conversation>\n\n"
+            f"User question: {question}\n\nAnswer:"
+        )
+
+    def answer_stream(
+        self,
+        user_id: int,
+        question: str,
+        history: list[dict],
+        doc_ids: list[int] | None = None,
+    ) -> tuple[list[dict], Iterator[str], str]:
+        """Returns (sources, token_iterator, mode). mode is 'llm', 'extractive' or 'empty'."""
+        # Use the previous user turn to enrich short follow-up questions ("and what about that?")
+        query = question
+        if len(question.split()) < 6:
+            prev_user = [m["content"] for m in history if m["role"] == "user"][-1:]
+            if prev_user:
+                query = f"{prev_user[0]} {question}"
+        hits = self.retrieve(user_id, query, doc_ids=doc_ids)
+
+        if not hits:
+            return [], iter([NO_MEMORY_REPLY]), "empty"
+
+        if not self.llm.available:
+            return hits, iter([self._extractive_answer(hits)]), "extractive"
+
+        prompt = self.build_prompt(question, hits, history)
+        return hits, self.llm.stream(SYSTEM_PROMPT, prompt), "llm"
+
+    @staticmethod
+    def _extractive_answer(hits: list[dict]) -> str:
+        lines = [
+            "_No language model is configured, so here are the most relevant passages from your memory:_",
+            "",
+        ]
+        for i, h in enumerate(hits[:4], start=1):
+            snippet = extractive_summary(h["text"], max_sentences=2)
+            where = f", p.{h['page']}" if h.get("page") else ""
+            lines.append(f"- **{h['title']}{where}** [{i}] — {snippet}")
+        return "\n".join(lines)
+
+    # -------------------------------------------------------------- vectors for graph
+    def document_centroids(self, user_id: int) -> dict[int, list[float]]:
+        col = self.collection(user_id)
+        if col.count() == 0:
+            return {}
+        res = col.get(include=["embeddings", "metadatas"])
+        embeddings = res.get("embeddings")
+        if embeddings is None or len(embeddings) == 0:
+            return {}
+        matrix = np.asarray(embeddings, dtype=np.float32)
+        groups: dict[int, list[int]] = {}
+        for i, meta in enumerate(res.get("metadatas") or []):
+            did = meta.get("doc_id")
+            if did is not None:
+                groups.setdefault(did, []).append(i)
+        return {did: matrix[idx].mean(axis=0).tolist() for did, idx in groups.items()}

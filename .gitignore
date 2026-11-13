@@ -15,3 +15,7 @@ frontend/dist/
 # OS
 .DS_Store
 Thumbs.db
+
+# App data (SQLite, vectors, secret key)
+backend/data/
+*.db
